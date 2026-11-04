@@ -5036,6 +5036,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++entries;
                 }
             ++d.pcie_experts;
+            d.pcie_bytes += (int64_t) bb;   // one copy of the blob per PCIe group (a distinct expert of the window)
         }
         P.start2[fetches] = entries;
         P.counts[0] = groups;

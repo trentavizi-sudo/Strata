@@ -45,6 +45,22 @@ int main() {
     StageSampler disabled_stages(4, false);
     disabled_stages.launch(0, t0);
     if (disabled_stages.sample(t0 + std::chrono::seconds(2), true)) return 12;
+    using XSampler = strata::core::ExpertWindowSampler;
+    using XSample = strata::core::ExpertWindowSample;
+    XSampler xoff(false);
+    if (xoff.add(XSample{1, 2, 0, 100, 10, 5, 2, 3, 4, 7, 0}, true, t0, t0)) return 13;
+    XSampler xs(true);
+    if (xs.add(XSample{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, t0, t0)) return 14;   // no window: nothing
+    if (xs.add(XSample{1, 2, 0, 1000, 300, 100, 20, 5, 10, 20, 2}, false, t0, t0 + std::chrono::milliseconds(10))) return 15;
+    const auto x1 = xs.add(XSample{1, 2, 0, 500, 200, 50, 10, 3, 12, 20, 1}, false, t0 + std::chrono::milliseconds(990),
+                           t0 + std::chrono::milliseconds(1000));
+    if (!x1 || x1->windows != 2 || x1->rows != 4 || x1->elapsed_ms != 1000 || x1->pcie_bytes != 1500 || x1->pool_us != 500 ||
+        x1->wait_us != 150 || x1->link_est_us != 30 || x1->misses != 8 || x1->hits != 22 || x1->entries != 40 || x1->offload != 3)
+        return 16;
+    if (XSampler::line(*x1) != "BXP 2 4 1000 1500 500 150 30 8 22 40 3") return 17;
+    const auto x2 = xs.add(XSample{1, 1, 0, 0, 7, 0, 0, 0, 9, 9, 0}, true, t0 + std::chrono::milliseconds(1001),
+                           t0 + std::chrono::milliseconds(1001));   // idle: a partial sample at once, span at least 1 ms
+    if (!x2 || x2->windows != 1 || x2->elapsed_ms != 1 || x2->pool_us != 7 || x2->hits != 9) return 18;
     std::puts("batch telemetry sampler: OK");
     return 0;
 }

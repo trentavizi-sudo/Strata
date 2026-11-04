@@ -1038,6 +1038,85 @@ def parse_batch_window_sample(line: str) -> dict | None:
             "elapsed_ms": elapsed_ms}
 
 
+EXPERT_SAMPLE_KEYS = ("windows", "rows", "elapsed_ms", "pcie_bytes", "pool_us", "wait_us", "link_est_us", "misses",
+                      "hits", "entries", "offload")
+
+
+def parse_expert_window_sample(line: str) -> dict | None:
+    """Read an opt-in engine BXP sample (STRATA_EXPERT_TELEMETRY=1): where the decode windows' expert work went, as the
+    engine's own counters say it - the bytes the GPU read over the link, the host's time in the CPU pool and waiting for
+    the GPU, and the routed entries each tier served.  Every field is a delta over the sample's windows.  The link time
+    is the engine's estimate from its start-up bandwidth probe, not a measurement."""
+    if len(line) > 200:
+        return None
+    match = re.fullmatch(r"BXP ([1-9][0-9]{0,9}) (0|[1-9][0-9]{0,9}) ([1-9][0-9]{0,9})"
+                         r"((?: (?:0|[1-9][0-9]{0,15})){8})\r?\n?", line)
+    if match is None:
+        return None
+    rest = [int(x) for x in match.group(4).split()]
+    sample = dict(zip(EXPERT_SAMPLE_KEYS, [int(match.group(1)), int(match.group(2)), int(match.group(3))] + rest))
+    if sample["elapsed_ms"] > 86_400_000 or sample["hits"] > sample["entries"] or sample["offload"] > sample["entries"]:
+        return None
+    return sample
+
+
+def expert_window_view(samples, totals: dict | None = None) -> dict | None:
+    """/metrics `expert_window` and /v1/telemetry: the last sample and the rates over the last few seconds of samples
+    (at most the engine's last 64).  Rates are per window and per routed entry; a reader multiplies by its own window
+    count.  `miss_cost_ms_window` is max(pool, link estimate) + wait per window: what the admission policy reads."""
+    rows = list(samples)
+    if not rows:
+        return None
+    last = rows[-1]
+    recent = [r for r in rows if r["observed_monotonic"] >= last["observed_monotonic"] - 5.0]
+    w = sum(r["windows"] for r in recent) or 1
+    ent = sum(r["entries"] for r in recent)
+    pool = sum(r["pool_us"] for r in recent) / 1000.0 / w
+    wait = sum(r["wait_us"] for r in recent) / 1000.0 / w
+    link = sum(r["link_est_us"] for r in recent) / 1000.0 / w
+    span = sum(r["elapsed_ms"] for r in recent)
+    rows_n = sum(r["rows"] for r in recent)
+    return {"windows": w, "rows": rows_n, "span_ms": span, "samples": len(recent),
+            "age_s": round(max(0.0, time.monotonic() - last["observed_monotonic"]), 3),
+            "ms_per_window": round(span / w, 3),
+            "pool_ms_window": round(pool, 3), "wait_ms_window": round(wait, 3), "link_est_ms_window": round(link, 3),
+            "miss_cost_ms_window": round(max(pool, link) + wait, 3),
+            "pcie_bytes_window": round(sum(r["pcie_bytes"] for r in recent) / w, 1),
+            "pcie_bytes_row": round(sum(r["pcie_bytes"] for r in recent) / max(1, rows_n), 1),
+            "misses_window": round(sum(r["misses"] for r in recent) / w, 3),
+            "hit_rate": round(sum(r["hits"] for r in recent) / ent, 4) if ent else None,
+            "offload_share": round(sum(r["offload"] for r in recent) / ent, 4) if ent else None,
+            "last": {k: last[k] for k in EXPERT_SAMPLE_KEYS},
+            # since the engine started: a benchmark takes the difference of two readings
+            "total": {k: int(totals.get(k, 0)) for k in EXPERT_SAMPLE_KEYS} if totals else None}
+
+
+def admission_policy(cfg: dict) -> dict | None:
+    """The config's `"admission"` section (opt-in; absent, null or false: the server admits whenever a slot is free,
+    as before).  `"admission": "pressure"` is the short form of `{"policy": "pressure"}`.  Read by
+    serve/admission.py; here only to decide whether the engine is asked for its telemetry."""
+    a = cfg.get("admission")
+    if a is None or a is False:
+        return None
+    if isinstance(a, str):
+        return {"policy": a}
+    if isinstance(a, dict) and a.get("policy"):
+        return dict(a)
+    return None
+
+
+def configure_expert_telemetry_env(env: dict, cfg: dict) -> None:
+    """`"expert_telemetry": true` in the config (or an admission policy that needs it) asks the engine for BXP lines.
+    Only an explicit setting changes the inherited environment, as configure_batch_telemetry_env."""
+    choice = cfg.get("expert_telemetry")
+    if choice is None and admission_policy(cfg) is not None:
+        choice = True
+    if choice is True:
+        env["STRATA_EXPERT_TELEMETRY"] = "1"
+    elif choice is False:
+        env.pop("STRATA_EXPERT_TELEMETRY", None)
+
+
 def parse_stage_in_flight_sample(line: str) -> dict | None:
     """Read bounded PSTAT host scheduling spans; these are not GPU utilization."""
     if len(line) > 256 or re.fullmatch(
@@ -1105,6 +1184,8 @@ class StrataEngine:
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
         self.terminal_batch_sample: dict | None = None
         self.terminal_stage_sample: dict | None = None
+        self.expert_samples = collections.deque(maxlen=64)   # BXP lines (STRATA_EXPERT_TELEMETRY=1), newest last
+        self.expert_totals = dict.fromkeys(EXPERT_SAMPLE_KEYS, 0)   # ... and their sum since this engine started
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
@@ -1338,6 +1419,13 @@ class StrataEngine:
                 sample = parse_batch_window_sample(line)
                 if sample is not None and self.proc is proc:
                     self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                continue                        # control telemetry never enters a request's token stream
+            if line.startswith("BXP"):
+                sample = parse_expert_window_sample(line)
+                if sample is not None and self.proc is proc:
+                    self.expert_samples.append({**sample, "observed_monotonic": time.monotonic()})
+                    for k in EXPERT_SAMPLE_KEYS:
+                        self.expert_totals[k] += sample[k]
                 continue                        # control telemetry never enters a request's token stream
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
@@ -5369,6 +5457,8 @@ class Service:
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
+        if getattr(self.engine, "expert_samples", None):   # STRATA_EXPERT_TELEMETRY=1: the engine's BXP samples
+            live["expert_window"] = expert_window_view(self.engine.expert_samples, getattr(self.engine, "expert_totals", None))
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
         if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
@@ -7638,6 +7728,12 @@ def make_handler(svc: Service):
                                                                        batch_sample["observed_monotonic"]))
                         snapshot["quality"]["batch_window_rows"] = "measured"
                         snapshot["quality"]["batch_window_source"] = "engine_bstat"
+                    expert_samples = (getattr(svc.engine, "expert_samples", None)
+                                      if svc.loaded() and not replica_engines else None)
+                    if expert_samples:
+                        snapshot["work"]["expert_window"] = expert_window_view(expert_samples,
+                                                                               getattr(svc.engine, "expert_totals", None))
+                        snapshot["quality"]["expert_window_source"] = "engine_bxp"
                     stage_sample = (getattr(svc.engine, "terminal_stage_sample", None)
                                     if svc.loaded() and not replica_engines else None)
                     if replica_engines:
@@ -9138,6 +9234,7 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
         exe2 = cfg2["exe"] if os.path.isabs(cfg2["exe"]) else os.path.abspath(os.path.join(cfg2.get("cwd") or ".", cfg2["exe"]))
     env2 = child_env(cfg2, offline=offline)
     configure_batch_telemetry_env(env2, cfg2, batch_telemetry)
+    configure_expert_telemetry_env(env2, cfg2)
     effort2 = effort_end_args(cfg2, exe2, tok)
     engine = StrataEngine(exe2, engine_args(cfg2, exe2) + (effort2 or []), cwd=cfg2.get("cwd"), log=cfg2.get("log"), env=env2, lazy=lazy,
                           retry_args=mtp_retry_args(cfg2, exe2, effort2))
@@ -9620,6 +9717,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                                           config_bytes, launch_args)
     if "batch_telemetry" in cfg and type(cfg["batch_telemetry"]) is not bool:
         ap.error("batch_telemetry must be true or false")
+    if "expert_telemetry" in cfg and type(cfg["expert_telemetry"]) is not bool:
+        ap.error("expert_telemetry must be true or false")
     try:
         ready_path = ready_file.preflight(a.ready_file) if a.ready_file else None
     except ValueError as e:
@@ -9727,6 +9826,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         # missing shard or a plugin would break the promise the flag makes.
         env = child_env(cfg, offline=a.offline)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
+        configure_expert_telemetry_env(env, cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())

@@ -13625,6 +13625,37 @@ int main(int argc, char** argv) {
         const bool batch_telemetry_enabled = batch_telemetry_env != nullptr &&
                                              batch_telemetry_env[0] == '1' && batch_telemetry_env[1] == '\0';
         strata::core::BatchWindowSampler batch_telemetry(batch_telemetry_enabled);
+        // STRATA_EXPERT_TELEMETRY=1 (opt-in; off: one branch per window): `BXP` lines with where a window's expert work went,
+        // as deltas of the dispatch's and CUDA0's verifier's own counters (batch_telemetry.hpp).  The admission policy on
+        // the server and tools/concurrency_bench.py read them; nothing else changes.
+        const char* xt_env = std::getenv("STRATA_EXPERT_TELEMETRY");
+        strata::core::ExpertWindowSampler expert_telemetry(xt_env != nullptr && xt_env[0] == '1' && xt_env[1] == '\0');
+        struct XtLast { double pool = 0, wait = 0; int64_t pcie_b = 0, misses = 0, hits = 0, entries = 0, offload = 0; } xt_last;
+        auto xt_delta = [&]() {   // the counters since the last call, and the mark moved
+            strata::core::ExpertWindowSample w;
+            w.pcie_bytes = drive.d.pcie_bytes - xt_last.pcie_b;
+            w.pool_us = (int64_t) ((ver.ms_pool - xt_last.pool) * 1000.0);
+            w.wait_us = (int64_t) ((ver.ms_wait - xt_last.wait) * 1000.0);
+            w.misses = drive.d.multi_misses - xt_last.misses;
+            w.hits = drive.d.cache_hits - xt_last.hits;
+            w.offload = drive.d.offload_entries - xt_last.offload;
+            w.entries = (drive.d.multi_entries + drive.d.cache_hits + drive.d.offload_entries) - xt_last.entries;
+            // the link time is an estimate from the start-up probe's bandwidth (0 when nothing was probed), never measured
+            w.link_est_us = o.pcie_probe_gbps > 0.0 ? (int64_t) ((double) w.pcie_bytes / (o.pcie_probe_gbps * 1e9) * 1e6) : 0;
+            xt_last = {ver.ms_pool, ver.ms_wait, drive.d.pcie_bytes, drive.d.multi_misses, drive.d.cache_hits,
+                       drive.d.multi_entries + drive.d.cache_hits + drive.d.offload_entries, drive.d.offload_entries};
+            return w;
+        };
+        auto report_expert_window = [&](int rows, bool idle, Clock::time_point started) {
+            if (!expert_telemetry.enabled()) return;
+            strata::core::ExpertWindowSample w = xt_delta();
+            w.windows = 1;
+            w.rows = rows;
+            if (const auto sample = expert_telemetry.add(w, idle, started, Clock::now())) {
+                std::printf("%s\n", strata::core::ExpertWindowSampler::line(*sample).c_str());
+                std::fflush(stdout);
+            }
+        };
         strata::program::ParCounters pc;   // STRATA_PAR_COUNTERS=1: counters only (par_counters.hpp); off: a branch
         auto pc_ex = [&]() {
             strata::program::ParCounters::Ex e;
@@ -14162,6 +14193,7 @@ int main(int argc, char** argv) {
             }
             strata::core::progress().busy.store(was_busy);
             report_batch_window(S, A, !batch_on(), w0);
+            report_expert_window(S, !batch_on(), w0);
             pc.window(S, A);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
@@ -14544,6 +14576,7 @@ int main(int argc, char** argv) {
                 ++pa_windows;
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
+                report_expert_window(G.S, !pipe_inflight() && !batch_on(), G.started);
                 pc.window(G.S, G.active);
             }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
@@ -17449,6 +17482,7 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            if (expert_telemetry.enabled()) (void) xt_delta();   // the decode's BXP sample starts here (the prompt's windows are not in it)
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
@@ -18679,6 +18713,14 @@ int main(int argc, char** argv) {
                 exit_if_gpu_fatal(err);
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (expert_telemetry.enabled() && dec_windows > 0) {   // one BXP line for the whole solo decode
+                strata::core::ExpertWindowSample w = xt_delta();
+                w.windows = dec_windows;
+                w.rows = dec_T;
+                w.elapsed_ms = std::max<int64_t>(1, (int64_t) decode_ms);
+                std::printf("%s\n", strata::core::ExpertWindowSampler::line(w).c_str());
+                std::fflush(stdout);
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();

@@ -89,6 +89,8 @@ def window():        # one batch window: every active slot one token
         print(f"BSTAT 1 {processed} {processed} 20", flush=True)
     if "--fake-stage-sample" in args and processed and not active:
         print("PSTAT 4 20000 16000 14000 12000 10000", flush=True)
+    if "--fake-expert-sample" in args and processed and not active:
+        print(f"BXP 1 {processed} 20 1382400 3000 1500 27 3 8 {processed * 10} 1", flush=True)
 log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
 PPK = int(args[args.index("--pp-every") + 1]) if "--pp-every" in args else 1
 READF = "--readfield" in args   # DONE's 15th field: the prompt tokens the engine read (a continued prompt: the 1 it copies)
@@ -322,7 +324,7 @@ class FakeEngineCase(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0,
-              more=(), stage_plan=False, batch_sample=False, stage_sample=False):
+              more=(), stage_plan=False, batch_sample=False, stage_sample=False, expert_sample=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -337,6 +339,7 @@ class FakeEngineCase(unittest.TestCase):
         extra += ["--fake-stage-plan"] if stage_plan else []
         extra += ["--fake-batch-sample"] if batch_sample else []
         extra += ["--fake-stage-sample"] if stage_sample else []
+        extra += ["--fake-expert-sample"] if expert_sample else []
         extra += list(more)
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
@@ -693,6 +696,34 @@ class ParallelService(FakeEngineCase):
         unloaded = self.get("/v1/telemetry")
         self.assertIsNone(unloaded["work"]["effective_rows_window"])
         self.assertEqual(unloaded["quality"]["batch_window_rows"], "unavailable")
+
+    def test_engine_expert_window_sample_reaches_metrics_and_telemetry(self):
+        """STRATA_EXPERT_TELEMETRY=1: the engine's BXP lines (where a window's expert work went) reach /metrics
+        `live.expert_window` and /v1/telemetry `work.expert_window`, and never a reply."""
+        self.start(2, expert_sample=True)
+        replies = self.race("first LONGREPLY", "second LONGREPLY", delay=0.05, max_tokens=64)
+        self.assertTrue(all("ok, " in reply and "BXP" not in reply for reply, _ in replies.values()))
+        deadline = time.monotonic() + 2
+        while True:
+            m = self.get("/metrics")
+            if m["live"].get("expert_window"):
+                break
+            if time.monotonic() >= deadline:
+                self.fail("fake engine's BXP sample did not reach /metrics")
+            time.sleep(0.02)
+        x = m["live"]["expert_window"]
+        self.assertEqual(x["last"]["pcie_bytes"], 1382400)
+        self.assertEqual(x["pool_ms_window"], 3.0)
+        self.assertEqual(x["wait_ms_window"], 1.5)
+        self.assertEqual(x["link_est_ms_window"], 0.027)
+        self.assertEqual(x["miss_cost_ms_window"], 4.5)          # max(pool, link) + wait
+        self.assertEqual(x["ms_per_window"], 20.0)
+        self.assertAlmostEqual(x["hit_rate"], 8 / x["last"]["entries"], places=4)
+        telemetry = self.get("/v1/telemetry")
+        self.assertEqual(telemetry["quality"]["expert_window_source"], "engine_bxp")
+        self.assertEqual(telemetry["work"]["expert_window"]["last"]["misses"], 3)
+        self.engine.unload()
+        self.assertNotIn("expert_window", self.get("/v1/telemetry")["work"])
 
     def test_pipeline_stage_host_spans_reach_telemetry_without_entering_reply(self):
         self.start(2, says_groups=2, stage_plan=True, stage_sample=True)

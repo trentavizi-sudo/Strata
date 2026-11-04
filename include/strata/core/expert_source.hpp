@@ -615,6 +615,7 @@ struct ExpertDispatch {
     int pcie_num = 0;
     PcieModel pcie_model;          ///< Verifier::set_pcie_balance: the PCIe count from measured costs
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    int64_t pcie_bytes = 0;        ///< the bytes those reads moved over the link (one blob per distinct expert; STRATA_EXPERT_TELEMETRY)
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;

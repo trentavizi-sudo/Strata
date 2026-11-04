@@ -1,6 +1,12 @@
 """Offline replay of a --dump-routing trace through the expert cache policies.
 
     python replay_cache_policy.py TRACE.bin PROFILE.bin SLOTS [--every 4 --decay 0.7 --swaps 96 --margin 1.5 --mincand 2.0]
+                                  [--policy lfu|lfru --recent 16] [--compare]
+
+--policy lfru is generate.cpp's `--adapt-policy lfru`: a resident expert's count is multiplied by 2^(-age/recent) when it
+is ranked as a victim (age = windows since it was last routed) and a candidate must have an age of at most `recent`.
+--compare runs lfu and lfru with the same settings and prints both.  PROFILE.bin may be "-": the cache then starts
+with the trace's own hottest pairs by the first 10% of its windows (a synthetic trace has no profile).
 
 Trace record = int32 layer, int32 k, k int32 ids, k float32 weights; the verify window writes one record per token and
 layer, so a layer group is the run of records with one layer and a window starts when the layer does not rise.
@@ -50,25 +56,37 @@ def load_profile(path, slots):
 
 
 class Policy:
-    def __init__(self, every=4, decay=0.7, swaps=96, margin=1.5, mincand=2.0, mode='entries', mingain=0.0, posw=1.0):
+    def __init__(self, every=4, decay=0.7, swaps=96, margin=1.5, mincand=2.0, mode='entries', mingain=0.0, posw=1.0,
+                 policy='lfu', recent=16):
         self.every, self.decay, self.swaps, self.margin, self.mincand = every, decay, swaps, margin, mincand
         self.mode, self.mingain, self.posw = mode, mingain, posw
+        self.policy, self.recent = policy, recent      # lfru: generate.cpp's --adapt-policy lfru, --adapt-recent
 
 
-def adapt_round(res, usage, pol):
+def adapt_round(res, usage, pol, last_used=None, now=0):
+    """One round of generate.cpp's adapt(): per layer the best non-resident against the worst resident.  With
+    `policy == 'lfru'`, `last_used` (the window each pair was last routed in) and `now` (the window count) rank the
+    victims by usage * 2^(-age/recent) and keep candidates to those routed within `recent` windows."""
     sw = []
+    lfru = pol.policy == 'lfru' and last_used is not None
     for l in range(NL):
         u = usage[l]
         r = res[l]
-        cand = np.flatnonzero(~r & (u >= pol.mincand))
+        if lfru:
+            age = now - last_used[l]
+            vscore = u * np.exp2(-age / float(max(1, pol.recent)))
+            cand = np.flatnonzero(~r & (u >= pol.mincand) & (age <= pol.recent))
+        else:
+            vscore = u
+            cand = np.flatnonzero(~r & (u >= pol.mincand))
         vict = np.flatnonzero(r)
         if len(cand) == 0 or len(vict) == 0:
             continue
         cand = cand[np.argsort(-u[cand], kind="stable")]
-        vict = vict[np.argsort(u[vict], kind="stable")]
+        vict = vict[np.argsort(vscore[vict], kind="stable")]
         n = min(len(cand), len(vict))
-        gain = u[cand[:n]] - u[vict[:n]]
-        ok = u[cand[:n]] >= u[vict[:n]] + pol.margin
+        gain = u[cand[:n]] - vscore[vict[:n]]
+        ok = u[cand[:n]] >= vscore[vict[:n]] + pol.margin
         # the engine stops at the first pair that does not clear the margin
         bad = np.flatnonzero(~ok)
         n2 = int(bad[0]) if len(bad) else n
@@ -86,9 +104,11 @@ def simulate(windows, init, pol, reset_every=0):
     res = np.zeros((NL, NE), bool)
     res[init[:, 0], init[:, 1]] = True
     usage = np.zeros((NL, NE))
+    last_used = np.zeros((NL, NE), dtype=np.int64) if pol.policy == 'lfru' else None
     hits = ent = swaps = 0
     miss_ent = miss_dist = 0
     for wi, w in enumerate(windows):
+        now = wi + 1                       # generate.cpp counts a window before its layers run
         for l, ids in w:
             r = res[l, ids]
             hits += int(r.sum())
@@ -103,11 +123,23 @@ def simulate(windows, init, pol, reset_every=0):
                 np.add.at(usage[l], ids.ravel(), wts)
             else:
                 np.add.at(usage[l], ids.ravel(), 1.0)
+            if last_used is not None:
+                last_used[l, ids.ravel()] = now
         if (wi + 1) % pol.every == 0:
-            swaps += adapt_round(res, usage, pol)
+            swaps += adapt_round(res, usage, pol, last_used, now)
             usage *= pol.decay
     return dict(share=hits / max(1, ent), swaps=swaps, windows=len(windows), entries=ent, miss_ent=miss_ent,
                 miss_dist=miss_dist)
+
+
+def trace_profile(windows, slots, head=0.1):
+    """A stand-in profile when there is none: the hottest `slots` pairs by the first `head` share of the windows."""
+    cnt = np.zeros((NL, NE))
+    for w in windows[: max(1, int(len(windows) * head))]:
+        for l, ids in w:
+            np.add.at(cnt[l], ids.ravel(), 1.0)
+    flat = np.argsort(-cnt.ravel(), kind="stable")[:slots]
+    return np.stack([flat // NE, flat % NE], axis=1)
 
 
 def static_oracle(windows, slots):
@@ -127,15 +159,20 @@ if __name__ == "__main__":
         return cast(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
 
     pol = Policy(every=opt("--every", 4, int), decay=opt("--decay", 0.7), swaps=opt("--swaps", 96, int),
-                 margin=opt("--margin", 1.5), mincand=opt("--mincand", 2.0))
+                 margin=opt("--margin", 1.5), mincand=opt("--mincand", 2.0),
+                 policy=opt("--policy", "lfu", str), recent=opt("--recent", 16, int))
     windows, k = load_trace(tr)
     print("windows", len(windows), "k", k, "tokens/window", np.mean([len(w[0][1]) for w in windows]))
-    init = load_profile(prof, slots)
+    init = load_profile(prof, slots) if prof != "-" else trace_profile(windows, slots)
     print("static oracle (top-%d by this trace's own counts): %.4f" % (slots, static_oracle(windows, slots)))
     base = simulate(windows, init, Policy(every=10**9))
     print("profile only, no adaptation: %.4f" % base["share"])
-    cur = simulate(windows, init, pol)
-    print("policy every %d, swaps %d, decay %.2f: share %.4f, swaps %d (%.2f/window); miss entries %d, distinct misses %d "
-          "(%.1f%% fewer reads)" % (pol.every, pol.swaps, pol.decay, cur["share"], cur["swaps"], cur["swaps"] / cur["windows"],
-                                    cur["miss_ent"], cur["miss_dist"],
-                                    100 * (1 - cur["miss_dist"] / max(1, cur["miss_ent"]))))
+    arms = [pol] if "--compare" not in sys.argv else [
+        Policy(pol.every, pol.decay, pol.swaps, pol.margin, pol.mincand, policy='lfu'),
+        Policy(pol.every, pol.decay, pol.swaps, pol.margin, pol.mincand, policy='lfru', recent=pol.recent)]
+    for p in arms:
+        cur = simulate(windows, init, p)
+        print("policy %s%s every %d, swaps %d, decay %.2f: share %.4f, swaps %d (%.2f/window); miss entries %d, distinct misses %d "
+              "(%.1f%% fewer reads)" % (p.policy, " recent %d" % p.recent if p.policy == 'lfru' else "", p.every, p.swaps, p.decay,
+                                        cur["share"], cur["swaps"], cur["swaps"] / cur["windows"], cur["miss_ent"], cur["miss_dist"],
+                                        100 * (1 - cur["miss_dist"] / max(1, cur["miss_ent"]))))

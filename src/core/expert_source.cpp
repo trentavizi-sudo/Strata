@@ -3086,6 +3086,26 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     return true;
 }
 
+void RouterLookahead::enable_credit(int64_t n_layers) {
+    if (n_layers <= 0 || n_expert_ <= 0) return;
+    credit_layers_ = n_layers;
+    credit_.reset(new std::atomic<uint32_t>[(size_t) (n_layers * n_expert_)]);
+    for (int64_t i = 0; i < n_layers * n_expert_; ++i) credit_[(size_t) i].store(0u, std::memory_order_relaxed);
+}
+
+int64_t RouterLookahead::take_credit(float* usage, float credit) {
+    if (credit_ == nullptr || usage == nullptr) return 0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < credit_layers_ * n_expert_; ++i) {
+        const uint32_t c = credit_[(size_t) i].exchange(0u, std::memory_order_relaxed);
+        if (c == 0) continue;
+        usage[i] += credit * (float) c;
+        n += c;
+    }
+    credited_.fetch_add(n, std::memory_order_relaxed);
+    return n;
+}
+
 void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
     if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
     {
@@ -3313,6 +3333,8 @@ void RouterLookahead::run() {
         else src_->warm(layer, want.data(), (int64_t) want.size());
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
+        if (credit_ != nullptr && dj == 0 && layer < credit_layers_)   // --adapt-predict-credit: the next layer's predictions
+            for (const int64_t e : want) credit_[(size_t) (layer * n_expert_ + e)].fetch_add(1u, std::memory_order_relaxed);
         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
         }
         busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
@@ -4910,7 +4932,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begun");
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+            if (ids[i] >= 0 && ids[i] < d.n_expert) {
+                const size_t ui = (size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i];
+                d.usage[ui] += 1.0f;
+                if (!d.last_used.empty()) d.last_used[ui] = d.window_seq;   // --adapt-policy lfru
+            }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;

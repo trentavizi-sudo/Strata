@@ -878,6 +878,14 @@ struct Options {
     int64_t adapt_warm_rounds = 0;
     int adapt_iv(int64_t rounds) const { return adapt_warm_every > 0 && rounds < adapt_warm_rounds ? adapt_warm_every : adapt_every; }   ///< the interval in force at verify round `rounds`
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    /// --adapt-policy lfu (0, the rule as before) | lfru (1): a resident expert's count fades with the windows since it
+    /// was last routed (halved every --adapt-recent windows) when it is ranked as a victim, and a candidate must have
+    /// been routed within the last --adapt-recent windows.  Hub experts (routed all the time) keep their whole count.
+    int adapt_policy = 0;
+    int adapt_recent = 16;
+    /// --adapt-predict-credit C (0 = off): the router look-ahead's predictions for the next layer add C each to the
+    /// routing counts before a round, so predicted experts take victims' slots in the main cache sooner.
+    float adapt_predict_credit = 0.0f;
     /// an expert is swapped into the VRAM tier only when its decayed routing count beats the one it replaces by more than
     /// this (--adapt-min-gain; both the blocking and the asynchronous tier)
     float adapt_min_gain = 1.5f;
@@ -1289,6 +1297,12 @@ void usage() {
                  "                       it fits.  STRATA_RESIDENT_HEADROOM_GIB, when set, decides the headroom instead.\n"
                  "  --adapt-min-gain F  the adaptive tier swaps an expert in only when its decayed routing count beats\n"
                  "                       the one it replaces by more than F (default 1.5; higher = fewer, surer swaps)\n"
+                 "  --adapt-policy lfu|lfru  lfru: a resident expert's count fades with the windows since it was last\n"
+                 "                       routed (halved every --adapt-recent windows, default 16) when it is ranked as a\n"
+                 "                       victim, and a candidate must have been routed that recently; lfu (default): the\n"
+                 "                       rule as before\n"
+                 "  --adapt-predict-credit C  the router look-ahead's next-layer predictions add C each to the routing\n"
+                 "                       counts before a round, so predicted experts take slots sooner (0, default: off)\n"
                  "  --adapt-async 0|1    --serve with the resident RAM mode or the arena (one GPU): the adaptive\n"
                  "                       tier's swaps advance between verify windows instead of a window waiting for a\n"
                  "                       whole round (the arena: copy-in only).  Not bit-exact run to run.  Without the flag,\n"
@@ -3628,6 +3642,14 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-policy") {
+            const std::string v = next("--adapt-policy");
+            if (v == "lfu") o.adapt_policy = 0;
+            else if (v == "lfru") o.adapt_policy = 1;
+            else { std::fprintf(stderr, "--adapt-policy: lfu or lfru, not %s\n", v.c_str()); return 2; }
+        }
+        else if (a == "--adapt-recent") o.adapt_recent = std::max(1, std::atoi(next("--adapt-recent")));
+        else if (a == "--adapt-predict-credit") o.adapt_predict_credit = std::max(0.0f, (float) std::atof(next("--adapt-predict-credit")));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
@@ -8458,7 +8480,10 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    // --adapt-predict-credit (or STRATA_ADAPT_LOOKAHEAD=1): the look-ahead runs on any tier, for the adaptive tier's credit
+    const bool la_credit = srcp != nullptr && (o.adapt_predict_credit > 0.0f ||
+                           [] { const char* v = std::getenv("STRATA_ADAPT_LOOKAHEAD"); return v != nullptr && std::atoi(v) != 0; }());
+    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats || la_credit) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -8471,7 +8496,7 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats || la_credit)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
@@ -12213,8 +12238,24 @@ int main(int argc, char** argv) {
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
         }
-        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident) {
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            if (o.adapt_policy == 1) {
+                drive.d.last_used.assign((size_t) (g.n_layers * g.n_expert), 0u);
+                std::fprintf(stderr, "strata serve: adaptive tier policy lfru: a resident expert's count halves every %d windows "
+                                     "since it was last routed; a candidate must have been routed within %d windows\n",
+                             o.adapt_recent, o.adapt_recent);
+            }
+            if (o.adapt_predict_credit > 0.0f) {
+                if (drive.d.lookahead != nullptr) {
+                    drive.d.lookahead->enable_credit(g.n_layers);
+                    std::fprintf(stderr, "strata serve: --adapt-predict-credit %.2f: the look-ahead's next-layer predictions count "
+                                         "towards the adaptive tier's swaps\n", o.adapt_predict_credit);
+                } else
+                    std::fprintf(stderr, "strata serve: --adapt-predict-credit is off: the router look-ahead is not running "
+                                         "(STRATA_LOOKAHEAD=0 or the routers could not be read)\n");
+            }
+        }
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -12487,20 +12528,37 @@ int main(int argc, char** argv) {
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        // --adapt-policy lfru: a victim's count fades with the windows since it was last routed (halved every
+        // --adapt-recent windows) and a candidate must have been routed within --adapt-recent windows.  `last` is the
+        // window the expert was last routed in, `now` the window count when the round's counts were taken.  Without
+        // the policy (no `last_used` table) both are the rule as before.
+        auto lfru_age = [](uint32_t last, uint32_t now) -> uint32_t { return now >= last ? now - last : 0u; };
+        auto lfru_victim = [&](float u, uint32_t last, uint32_t now) -> float {
+            return u * std::exp2(-(float) lfru_age(last, now) / (float) std::max(1, o.adapt_recent));
+        };
+        auto lfru_cand_ok = [&](uint32_t last, uint32_t now) -> bool { return lfru_age(last, now) <= (uint32_t) o.adapt_recent; };
+        // --adapt-predict-credit: the look-ahead's predictions since the last round go into the counts a round reads
+        auto adapt_credit = [&](float* usage) {
+            if (o.adapt_predict_credit > 0.0f && drive.d.lookahead != nullptr && drive.d.lookahead->credit_on())
+                drive.d.lookahead->take_credit(usage, o.adapt_predict_credit);
+        };
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            adapt_credit(drive.d.usage.data());
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
+            const uint32_t now_w = drive.d.window_seq;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                const uint32_t* lu = drive.d.last_used.empty() ? nullptr : drive.d.last_used.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0) { if (u[e] >= 2.0f && (lu == nullptr || lfru_cand_ok(lu[e], now_w)) && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    else vict.emplace_back(lu == nullptr ? u[e] : lfru_victim(u[e], lu[e], now_w), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -12707,6 +12765,8 @@ int main(int argc, char** argv) {
         AState astate = AState::Idle;
         std::vector<ASwap> aswaps;
         std::vector<float> a_usage;
+        std::vector<uint32_t> a_last;   // --adapt-policy lfru: the recency table and the window count with the snapshot
+        uint32_t a_seq = 0;
         std::vector<int32_t> a_res;
         int64_t a_win = 0, a_last = 0, a_rounds = 0, a_swapped = 0;
         double a_ms = 0;                  // wall time from a round's start to its flip, summed (the "ms/round" stat)
@@ -12773,9 +12833,10 @@ int main(int argc, char** argv) {
                 vict.clear();
                 const float* u = a_usage.data() + l * g.n_expert;
                 const int32_t* r = a_res.data() + l * g.n_expert;
+                const uint32_t* lu = a_last.empty() ? nullptr : a_last.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0) { if (u[e] >= 2.0f && (lu == nullptr || lfru_cand_ok(lu[e], a_seq)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    else vict.emplace_back(lu == nullptr ? u[e] : lfru_victim(u[e], lu[e], a_seq), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -12938,7 +12999,10 @@ int main(int argc, char** argv) {
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
+                    adapt_credit(drive.d.usage.data());
                     a_usage = drive.d.usage;
+                    a_last = drive.d.last_used;
+                    a_seq = drive.d.window_seq;
                     a_res = host_res;
                     // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
                     for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
@@ -13995,6 +14059,7 @@ int main(int argc, char** argv) {
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
+            ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
@@ -16184,6 +16249,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> w0((size_t) S), w1((size_t) S), nx((size_t) S);
                 size_t l0 = 0, f0 = 0, l1 = 0, f1 = 0;   // stage 0 launched / finished, stage 1 launched / finished
                 drive.d.layers = 0;
+                ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 auto fail = [&](std::string why) -> bool {
@@ -16279,6 +16345,7 @@ int main(int argc, char** argv) {
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
                     }
                     drive.d.layers = 0;
+                    ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
@@ -17574,6 +17641,7 @@ int main(int argc, char** argv) {
                 A.tok[0] = x;
                 A.ready = true;
                 drive.d.layers = 0;
+                ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // the adaptive tier beside the pipeline: the serial loop's rule and adapt() on a thread of its own (its
@@ -18320,6 +18388,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 drive.d.layers = 0;
+                ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
@@ -19518,6 +19587,7 @@ int main(int argc, char** argv) {
         // `FileExpertSource` REFUSES rather than wrapping into layer 0's experts, and that refusal is the only
         // reason this was a clean error instead of a silently wrong second token.
         drive.d.layers = 0;
+        ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
         drive.d.experts = 0;
         drive.d.failed = false;
         err.clear();
@@ -19782,7 +19852,10 @@ int main(int argc, char** argv) {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.adapt_every > 0 && o.adapt_swaps > 0) {
+            drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            if (o.adapt_policy == 1) drive.d.last_used.assign((size_t) (g.n_layers * g.n_expert), 0u);
+        }
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends
@@ -20270,6 +20343,7 @@ int main(int argc, char** argv) {
                 window[(size_t) i] = d;
             }
             drive.d.layers = 0;
+            ++drive.d.window_seq;   // (--adapt-policy lfru: the recency clock)
             drive.d.experts = 0;
             drive.d.failed = false;
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in

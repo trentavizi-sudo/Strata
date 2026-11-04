@@ -330,6 +330,16 @@ public:
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
     void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
     int depth() const { return depth_; }
+    /// --adapt-predict-credit C (opt-in, 0 = off): every expert the look-ahead predicts for the next layer that no GPU
+    /// slot holds is counted here; the adaptive tier adds C per prediction to its routing count before a round, so a
+    /// predicted expert takes a victim's slot in the MAIN cache sooner (the tier's own copy path; no side slots).  The
+    /// look-ahead thread adds, the tier's thread takes the counts (`take_credit`).  Off: nothing is counted.
+    void enable_credit(int64_t n_layers);
+    bool credit_on() const { return credit_ != nullptr; }
+    /// Adds `credit` x the predictions counted since the last call to `usage` (n_layers x n_expert) and clears them;
+    /// returns how many predictions were credited.
+    int64_t take_credit(float* usage, float credit);
+    int64_t credited() const { return credited_.load(std::memory_order_relaxed); }
     /// STRATA_LOOKAHEAD_STATS=1 (measurement only): remember each prediction (top k, k+4 and k+10 per token) and let the
     /// dispatch score it against the experts the next layer really routes outside the GPU cache.
     void enable_stats(int64_t n_layers);
@@ -358,6 +368,10 @@ private:
     std::vector<float> x_;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
+    // --adapt-predict-credit
+    std::unique_ptr<std::atomic<uint32_t>[]> credit_;   // [layer * n_expert + e]: predictions since the tier last took them
+    int64_t credit_layers_ = 0;
+    std::atomic<int64_t> credited_{0};
     // STRATA_LOOKAHEAD_STATS
     bool stats_on_ = false;
     int64_t words_ = 0;
@@ -640,6 +654,12 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// --adapt-policy lfru: the window each (layer, expert) was last routed in (`window_seq` then; sized with `usage` by
+    /// the driver when the policy is on, else empty) and the windows the driver has started (it counts them where it
+    /// resets `layers` for a window).  The tier reads both: a resident expert's count fades with the windows since it
+    /// was last routed, a candidate must have been routed recently.  Empty: the rule as before.
+    std::vector<uint32_t> last_used;
+    uint32_t window_seq = 0;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies

@@ -149,6 +149,9 @@ on the CPU, a batch also reads about as many distinct experts as the requests on
 route to different experts), so the gain is in **latency** (nobody waits for a whole answer), and a request alone
 runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below.
 
+`--kv-grow-slots` (opt-in, [DETAILS.md](DETAILS.md#kv-cache)) makes the slots' K/V elastic: the slots take VRAM only
+for the cells their conversations reach, and the expert cache holds the rest until a conversation grows. Not measured yet.
+
 So setup recommends `"parallel"` **only where the experts mostly fit in VRAM**: the expert cache (each card's VRAM
 less ~5 GB, every card of a layer split counted) must still hold at least half of the model's experts beside the
 slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at 32K that is 3 slots on a 24 GB

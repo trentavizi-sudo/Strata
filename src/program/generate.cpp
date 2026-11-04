@@ -22,6 +22,7 @@
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
+#include "strata/core/kv_grow_plan.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
@@ -663,6 +664,10 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    /// --kv-grow-slots (implies --kv-grow): the batch slots' sessions are elastic too.  Every state's K/V pools grow
+    /// together to the cells the furthest conversation reaches (an admission, a window) and shrink only below what any
+    /// slot still holds for its next turn, from the same chunks the expert cache gives up.  Off: --batch turns --kv-grow off.
+    bool kv_grow_slots = false;
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -1050,6 +1055,9 @@ void usage() {
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
                  "                       allocated at start\n"
+                 "  --kv-grow-slots      --kv-grow for the batch slots too (--batch N): every slot's K/V grows with the\n"
+                 "                       longest conversation and shrinks only below what a slot still holds; opt-in,\n"
+                 "                       pending GPU validation. Default: --batch keeps the whole K/V per slot\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -3371,6 +3379,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
+        else if (a == "--kv-grow-slots") { o.kv_grow = true; o.kv_grow_slots = true; }
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
@@ -6386,11 +6395,16 @@ int main(int argc, char** argv) {
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
-                            // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+                            // the batch slots carve their own K/V (unless --kv-grow-slots makes them elastic too) and
+                            // --vram-elastic's cache is not one VMM range
+                            (o.batch == 0 || o.kv_grow_slots) && !o.vram_elastic && o.peer_device < 0;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
-                                     "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+                                     "every expert in RAM, no --batch without --kv-grow-slots, no --vram-elastic or --peer-device)\n");
+            if (on && o.batch > 0)
+                std::fprintf(stderr, "strata generate: --kv-grow-slots: the %d batch slots' K/V is elastic too - every slot's pools grow "
+                                     "together to the longest conversation's cells and shrink only below what a slot still holds "
+                                     "(pending GPU validation)\n", o.batch);
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
@@ -13795,6 +13809,11 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            // --kv-grow-slots: the slot's pools (every pool: they grow together) must hold the cells the copy writes
+            if (kvg.on && o.kv_grow_slots && !kvg_ensure(upto + 256, adapt_quiesce)) {
+                e = "the K/V cannot grow for the slot: no VRAM is left";
+                return false;
+            }
 #if defined(STRATA_GPU_METAL)
             // the running state and the K/V of the Metal window, not the session's device buffers
             return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
@@ -13852,6 +13871,10 @@ int main(int argc, char** argv) {
             conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
+            if (kvg.on && o.kv_grow_slots && !kvg_ensure(upto + 256, adapt_quiesce)) {   // the main session's cells for the copy
+                e = "the K/V cannot grow for the slot's conversation: no VRAM is left";
+                return false;
+            }
 #if defined(STRATA_GPU_METAL)
             if (!strata::metal_engine::window_slot_copy_main(false, b, upto, at != nullptr, e)) return false;
             return at == nullptr || strata::core::conversation_checkpoint_restore(*at, ss, g, e);   // (the checkpoint's running state)
@@ -14055,6 +14078,14 @@ int main(int argc, char** argv) {
                 }
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+            // --kv-grow-slots: the window's rows and what they append, with the solo path's margin (kv_grow_plan.hpp)
+            if (kvg.on && o.kv_grow_slots && S > 0) {
+                const int64_t need = strata::core::kvgrow::target_cells(pos, S, 1, 64, kvg.step, o.max_context);
+                if (need > kvg.cells && !kvg_ensure(need, adapt_quiesce)) {
+                    err = "the K/V cannot grow for the batch window: no VRAM is left";
+                    return false;
+                }
+            }
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -16027,7 +16058,14 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                int64_t slots_hold = 0;   // --kv-grow-slots: the pools shrink together, so never below what a slot still holds
+                if (o.kv_grow_slots && !bs.empty()) {
+                    std::vector<int64_t> held(bs.size(), 0);
+                    for (size_t b = 0; b < bs.size(); ++b)
+                        if (bs[b].active || bs[b].cached || bs[b].partial) held[b] = (int64_t) bs[b].ids.size();
+                    slots_hold = strata::core::kvgrow::slots_hold(held.data(), (int) held.size(), 256);
+                }
+                if (!kvg_trim(n + 256, std::max<int64_t>(hold_on ? conversations.longest_tokens() + 256 : 0, slots_hold))) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;

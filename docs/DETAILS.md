@@ -237,6 +237,8 @@ reported and, for files in your own folder, never deleted. Without `uvx`, `pip i
 | `--kv-streaming on\|off\|auto` | Keeps the context's KV cache in RAM and only the part attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Costs about 13.7 KB of RAM per context token (1.7 GB at 128K). Setup turns it on from 64K when the RAM has room; `on` overrides the RAM test with a note. Never under WSL. |
 | `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off) | The KV takes VRAM only for the cells the requests reach; the expert cache holds the rest and gives slots back as the context grows. Needs one GPU, an expert profile, the whole KV in VRAM and every expert in RAM. Otherwise the engine says so and stays off. On HIP it uses virtual memory management (`STRATA_HIP_VMM=0` turns that off). It pays on cards of about 24 GB or less with contexts of 128K and more. |
 
+| `--kv-grow-slots` (opt-in; implies `--kv-grow`) | With `--batch N` (`"parallel": N`): the slots' K/V is elastic too. Every state's pools grow together to the cells the longest conversation reaches (an admission's copy, a window) and shrink only below what a slot still holds for its next turn, from the chunks the expert cache gives up. Each slot otherwise takes the whole `--max-context` K/V at start (0.52 GiB at 32K int8, measured on 2x RX 7900 GRE). Uniform growth: four slots with one long conversation hold four long K/Vs; a per-slot size is a follow-up. Same limits as `--kv-grow` (one GPU, a profile, the whole K/V in VRAM, every expert in RAM). Not measured on a GPU. |
+
 `STRATA_KV_HOST_REGISTER=1` forces the KV host copy to be pinned with `cudaHostRegister` (the order WSL2 uses
 automatically); `0` forces `cudaHostAlloc` first.
 

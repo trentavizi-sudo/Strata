@@ -83,6 +83,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve.admission import PressurePolicy  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -1132,6 +1133,13 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
 
 
 class StrataEngine:
+    # "admission": "pressure" (serve/admission.py): the policy and its counters.  Class defaults, so an engine built any
+    # way (lazy, a test's bare one) has them; the started engine's slot state block sets them again.
+    admission: PressurePolicy | None = None
+    admission_held = 0
+    admission_hold_s = 0.0
+    admission_last: dict | None = None
+
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
 
@@ -1378,6 +1386,10 @@ class StrataEngine:
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.admission: PressurePolicy | None = None   # "admission": "pressure" (serve/admission.py); None: a free slot admits
+            self.admission_held = 0                     # requests the policy held at least once
+            self.admission_hold_s = 0.0                 # the seconds they were held, summed
+            self.admission_last: dict | None = None     # the policy's last decision (why, pressure, threshold)
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
@@ -2005,11 +2017,15 @@ class StrataEngine:
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
+                held = False
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                     if turn and new and ADMIT_SHORT_FIRST > 0:
                         turn = self._admit_next() is entry
-                left = deadline - time.monotonic() if deadline is not None else 0.5
+                    if turn and new and self.admission is not None:
+                        held = self._admission_hold(entry)
+                        turn = turn and not held
+                left = deadline - time.monotonic() if deadline is not None else (0.1 if held else 0.5)
                 if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
                     if new and ADMIT_SHORT_FIRST > 0:
                         with self.slot_cv:              # a shorter one came while this one waited in acquire()
@@ -2043,6 +2059,33 @@ class StrataEngine:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def _admission_hold(self, entry) -> bool:
+        """`"admission": "pressure"` (the caller holds slot_cv): whether this new request waits a little longer because
+        the running windows are miss-bound (serve/admission.py).  Hold, never reject: the request stays queued, is asked
+        again every 0.1 s, and goes in once the pressure drops or it has waited the policy's max_wait_s."""
+        now = time.monotonic()
+        # what a new admission would slow down: the slots decoding, and the request on the control lines (one running
+        # alone on the solo path, or one being admitted - its windows start as soon as its prompt is read)
+        busy = sum(1 for b in self.slot_busy if b) + (1 if self.ctl.locked() else 0)
+        view = expert_window_view(self.expert_samples, None) if self.expert_samples else None
+        hold, why = self.admission.decide(view, busy, now - entry[1])
+        self.admission_last = why
+        if hold:
+            if len(entry) < 6:
+                entry.append(now)                   # held since (counted once per request)
+                self.admission_held += 1
+        elif len(entry) >= 6:
+            self.admission_hold_s += now - entry[5]
+            del entry[5:]
+        return hold
+
+    def admission_view(self) -> dict | None:
+        """/metrics `live.admission`: the policy and what it did."""
+        if self.admission is None:
+            return None
+        return {**self.admission.describe(), "held": self.admission_held, "hold_s": round(self.admission_hold_s, 3),
+                "last": self.admission_last}
 
     def _release_preslot(self, cancel):
         """STRATA_COALESCE_PREFILL: the request that was given a slot ahead of its turn left before using it."""
@@ -5457,6 +5500,8 @@ class Service:
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
+        if getattr(self.engine, "admission", None) is not None:   # "admission": "pressure": the policy and its holds
+            live["admission"] = self.engine.admission_view()
         if getattr(self.engine, "expert_samples", None):   # STRATA_EXPERT_TELEMETRY=1: the engine's BXP samples
             live["expert_window"] = expert_window_view(self.engine.expert_samples, getattr(self.engine, "expert_totals", None))
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -7728,6 +7773,8 @@ def make_handler(svc: Service):
                                                                        batch_sample["observed_monotonic"]))
                         snapshot["quality"]["batch_window_rows"] = "measured"
                         snapshot["quality"]["batch_window_source"] = "engine_bstat"
+                    if getattr(svc.engine, "admission", None) is not None and svc.loaded() and not replica_engines:
+                        snapshot["work"]["admission"] = svc.engine.admission_view()
                     expert_samples = (getattr(svc.engine, "expert_samples", None)
                                       if svc.loaded() and not replica_engines else None)
                     if expert_samples:
@@ -9940,6 +9987,17 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             svc.vision = _dsp
             print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; --vision off turns them off)", flush=True)
     svc.offline = a.offline
+    if a.engine == "strata" and admission_policy(cfg) is not None:
+        try:
+            engine.admission = PressurePolicy.from_config(admission_policy(cfg))
+        except ValueError as e:
+            ap.error(str(e))
+        if parallel_slots(cfg) < 2:
+            print('[strata] "admission": "pressure" does nothing without "parallel" (batch slots): one request at a time', flush=True)
+        else:
+            print(f"[strata] admission: hold a new request while the running windows are miss-bound "
+                  f"(pressure above {engine.admission.threshold:.2f} of the window, at most {engine.admission.max_wait_s:.0f} s); "
+                  f"the engine's expert telemetry is on for it", flush=True)
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)

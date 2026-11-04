@@ -386,6 +386,33 @@ one cold 64K prompt joining four streams: `STRATA_BATCH_DECODE_SHARE=2.0` 2.4 s 
 s and 13.8 s. Pieces of one chunk (`PIECE=8192`) cost the long prompt the most. Not measured: other GPU pairs, three or
 more stages, HIP and SYCL (built for CUDA only), sampled decoding, prompts with pictures.
 
+## Admission by expert-miss pressure (`"admission": "pressure"`, opt-in)
+
+With slots, the server admits a request as soon as a slot is free. On a card whose expert cache holds a small share of
+the model, every admitted conversation routes to experts of its own, and the CPU pool and the link carry more misses
+per window for everyone. `"admission": "pressure"` in the model's config makes the server **hold** a new request while
+the running windows are miss-bound, and admit it once they are not (or after `max_wait_s`). It never rejects, and a
+request that would run alone is never held.
+
+```
+"parallel": 4,
+"admission": {"policy": "pressure", "threshold": 0.5, "max_wait_s": 30, "stale_s": 3, "min_windows": 4, "min_busy": 1}
+```
+
+`"admission": "pressure"` alone takes those defaults. The signal is the engine's own account of its windows
+(`STRATA_EXPERT_TELEMETRY=1`, which the server sets for the engine when the policy is on; the `BXP` lines): the miss
+cost of a window, max(CPU pool ms, link estimate ms) plus the host's wait for the GPU, over the window's wall time.
+`threshold` is that share: 0.5 holds admissions while more than half of the inter-token time is miss cost, on a 12 GB
+card as on a 24 GB one. `stale_s` ignores a sample older than that (an idle engine holds nobody); `min_windows` asks
+for that many windows in the recent samples before judging; `min_busy` is the fewest slots decoding (the request on
+the control lines counts) for a hold to make sense. `GET /metrics` shows `live.admission` (the settings, how many
+requests were held, for how long in all, and the last decision with its reason) and `live.expert_window` (the
+rates the decision read). The hold keeps the server's queue timeout: a held request that reaches it still gets its 429.
+
+It is the pressure now, not a prediction of the new request's own working set (that would need its prompt read first,
+which is the cost an admission pays). Measured: nothing yet; the harness is `tools/concurrency_bench.py`
+([CONCURRENCY_BENCH.md](CONCURRENCY_BENCH.md)). Without the key nothing changes.
+
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to, and every `--adapt-every` windows (default 4) the engine swaps the

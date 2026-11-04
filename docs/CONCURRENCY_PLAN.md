@@ -173,6 +173,24 @@ so the policy can move into the engine later without a rewrite.
 Acceptance: nothing is done until its GPU benchmark shows an aggregate gain at 2/4/8 with no single-request
 regression (TTFT and ITL at 1 client unchanged within noise). Every new flag defaults to current behaviour.
 
+## Status after the cloud phase
+
+Built, unit-tested here, and committed on this branch; nothing has run on a GPU:
+
+| Deliverable | Where | Flag or key (default: as before) | Tests here |
+| --- | --- | --- | --- |
+| expert telemetry (`BXP` lines: PCIe bytes, pool ms, wait ms, link estimate, misses, hits per window) | `batch_telemetry.hpp`, `generate.cpp`, `serve/server.py` (`live.expert_window`) | `STRATA_EXPERT_TELEMETRY=1`, config `"expert_telemetry": true` | `batch_telemetry_test`, `serve/test_expert_telemetry.py`, the fake-engine round trip |
+| concurrency harness | `tools/concurrency_bench.py` | - | `serve/test_concurrency_bench.py` |
+| admission by miss pressure | `serve/admission.py`, `serve/server.py` | `"admission": "pressure"` | `serve/test_admission.py` |
+| LFRU and the look-ahead credit | `generate.cpp` adapt / a_pick, `expert_source.*` | `--adapt-policy lfru`, `--adapt-recent`, `--adapt-predict-credit` | `tools/test_replay_cache_policy.py`; offline replay below |
+| elastic K/V for slots | `generate.cpp` kvg_*, `kv_grow_plan.hpp` | `--kv-grow-slots` | `kv_grow_plan_test` |
+| runbook | [CONCURRENCY_BENCH.md](CONCURRENCY_BENCH.md) | - | - |
+
+Offline finding to carry into the GPU runs: on synthetic routing traces (`tools/synth_routing_trace.py`, Zipf with
+hub experts and phase shifts) the LFRU rule was within 0.1% of the existing LFU-decay rule in hit share and swapped
+more, because `--adapt-decay` already ages the counts. A synthetic trace has no real locality; the GPU benchmark
+decides, and `--adapt-policy lfru` stays off until it does.
+
 ## Cloud-session limits
 
 No CUDA toolchain in the cloud session: the C++ changes are compile-checked only where a host-only target

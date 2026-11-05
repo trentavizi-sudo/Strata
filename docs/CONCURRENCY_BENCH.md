@@ -64,9 +64,10 @@ trellis kernels `tq_*.cpp` serve the Gyro packs only. If the trellis path is wan
 
 ## Step 2: the config
 
-The harness takes the server's `strata-<model>.json`, which `strata launch` writes into the Strata data folder
-(`--data-dir`; `strata launch --save-preset conc` keeps the launch choices under a name). Make one copy per arm;
-the harness adds `"parallel"` from `--parallel` and sets `"expert_telemetry": true` itself.
+The harness takes the server's run config (the JSON the server starts from). `strata launch` writes it as
+`launch/<name>.json` in the Strata state folder: `~/.local/state/strata/launch/` on Linux (or `$XDG_STATE_HOME/strata/launch/`),
+`%LOCALAPPDATA%\\Strata\\launch\\` on Windows. `strata launch --save-preset conc` keeps the launch choices under a name.
+Make one copy per arm; the harness adds `"parallel"` from `--parallel` and sets `"expert_telemetry": true` itself.
 
 Floor card (3060): keep the context at 32K (`--context 32k`) or set `--kv-resident 32768`; four full slots at a
 long context would take the cache (plan, "Batch slots cost the cache too").
